@@ -54,11 +54,33 @@ def load_data():
 
     # Keep the latest version of each order ID.
     current = {}
+
     for order in orders:
         oid = order["id"]
+
+        updated = datetime.fromisoformat(
+            order["updated_at"].replace("Z", "+00:00")
+        )
+
+        # Normalize timestamps before comparing them.
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=TZ)
+
+        updated = updated.astimezone(ZoneInfo("UTC"))
+
         old = current.get(oid)
-        if old is None or order["updated_at"] > old["updated_at"]:
-            current[oid] = order
+
+        if old is None or updated > old["_updated_utc"]:
+            current[oid] = {
+                **order,
+                "_updated_utc": updated,
+            }
+
+# Remove the internal comparison field.
+    orders = [
+        {k: v for k, v in order.items() if k != "_updated_utc"}
+        for order in current.values()
+    ]
 
     rates_response = session.get(links["rates"], timeout=10)
     rates_response.raise_for_status()
@@ -164,8 +186,18 @@ def calculate(question):
         if metric in ("revenue", "top_product"):
             if status != "paid":
                 continue
+
         elif metric == "refund":
             if status != "refunded":
+                continue
+
+        elif metric == "count":
+            # Apply status restrictions stated in the question.
+            if re.search(r"\bpaid\b", q) and status != "paid":
+                continue
+            if re.search(r"\brefunded\b", q) and status != "refunded":
+                continue
+            if re.search(r"\bvoid\b", q) and status != "void":
                 continue
 
         if (
