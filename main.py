@@ -1,5 +1,4 @@
 
-
 import os
 import re
 import json
@@ -45,7 +44,7 @@ def load_data():
     links = info["links"]
 
     # Export is NDJSON: one order per line.
-    response = session.get(links["export"], timeout=20)
+    response = session.get(links["export"], timeout=30)
     response.raise_for_status()
     orders = [
         json.loads(line)
@@ -53,7 +52,7 @@ def load_data():
         if line.strip()
     ]
 
-    # Latest updated_at record is the current record for an order ID.
+    # Keep the latest version of each order ID.
     current = {}
     for order in orders:
         oid = order["id"]
@@ -84,7 +83,7 @@ def interpret(question):
     q = question.lower()
     filters = {}
 
-    # Date filter: month + year.
+    # Month + year filter.
     for name, month in MONTHS.items():
         match = re.search(rf"\b{name}\s+(20\d{{2}})\b", q)
         if match:
@@ -96,7 +95,7 @@ def interpret(question):
             )
             break
 
-    # Explicit year alone.
+    # Year-only filter.
     if "start" not in filters:
         match = re.search(r"\b(20\d{2})\b", q)
         if match:
@@ -104,23 +103,25 @@ def interpret(question):
             filters["start"] = date(year, 1, 1)
             filters["end"] = date(year + 1, 1, 1)
 
+    # Region filter.
     for region in ["North", "South", "East", "West", "Central"]:
         if re.search(rf"\b{region.lower()}\b", q):
             filters["region"] = region
             break
 
-    # Product names are discovered from the actual data.
+    # Discover product names from the data.
     orders, _ = load_data()
     products = sorted(
-        {o["product"] for o in orders},
+        {o["product"] for o in orders if o.get("product")},
         key=len,
-        reverse=True
+        reverse=True,
     )
     for product in products:
         if product.lower() in q:
             filters["product"] = product
             break
 
+    # Customer ID filter.
     match = re.search(r"\bC\d+\b", question, re.I)
     if match:
         filters["customer"] = match.group().upper()
@@ -132,41 +133,64 @@ def calculate(question):
     q, filters = interpret(question)
     orders, rates = load_data()
 
-    # Determine metric.
-    if any(word in q for word in ["refund", "refunded"]):
+    # Determine what the question asks.
+    if re.search(r"\b(refund|refunded|refunds)\b", q):
         metric = "refund"
-    elif any(word in q for word in ["how many", "number of", "count"]):
-        metric = "count"
-    elif any(word in q for word in ["which product", "top product",
-                                    "best-selling", "bestselling"]):
+    elif re.search(
+        r"\b(which product|top product|best-selling|bestselling)\b", q
+    ):
         metric = "top_product"
+    elif re.search(
+        r"\b(how many|number of|count|different customers|"
+        r"distinct customers|unique customers)\b", q
+    ):
+        metric = "count"
     else:
         metric = "revenue"
 
+    # Requested output currency.
     currency = "USD"
     for code in rates:
-        if re.search(rf"\b{code.lower()}\b", q):
+        if re.search(rf"\b{re.escape(code.lower())}\b", q):
             currency = code
             break
 
     selected = []
+
     for o in orders:
-        if metric == "refund":
-            if o["status"].lower() != "refunded":
+        status = str(o.get("status", "")).lower()
+
+        # Apply the appropriate status filter.
+        if metric in ("revenue", "top_product"):
+            if status != "paid":
                 continue
-        elif metric == "revenue" or metric == "top_product":
-            if o["status"].lower() != "paid":
+        elif metric == "refund":
+            if status != "refunded":
                 continue
 
-        if filters.get("region") and o["region"].lower() != filters["region"].lower():
+        if (
+            filters.get("region")
+            and str(o.get("region", "")).lower()
+            != filters["region"].lower()
+        ):
             continue
-        if filters.get("product") and o["product"] != filters["product"]:
+
+        if (
+            filters.get("product")
+            and str(o.get("product", "")).lower()
+            != filters["product"].lower()
+        ):
             continue
-        if filters.get("customer") and o["customer"].upper() != filters["customer"]:
+
+        if (
+            filters.get("customer")
+            and str(o.get("customer", "")).upper()
+            != filters["customer"]
+        ):
             continue
 
         try:
-            created = parse_date(o["created_at"])
+            created = parse_date(o.get("created_at"))
         except (ValueError, TypeError):
             continue
 
@@ -174,6 +198,7 @@ def calculate(question):
             created is None or created < filters["start"]
         ):
             continue
+
         if filters.get("end") and (
             created is None or created >= filters["end"]
         ):
@@ -181,36 +206,59 @@ def calculate(question):
 
         selected.append(o)
 
+    # Count distinct customers, not order rows.
     if metric == "count":
+        if re.search(
+            r"\b(different|distinct|unique)\s+customers?\b", q
+        ):
+            return len({
+                str(o["customer"]).strip().upper()
+                for o in selected
+                if o.get("customer") is not None
+                and str(o["customer"]).strip()
+            })
+
+        # Ordinary order count.
         return len(selected)
 
     if metric == "top_product":
         totals = {}
+
         for o in selected:
+            source_currency = o["currency"]
+            if source_currency not in rates:
+                continue
+
             value = (
                 Decimal(str(o["amount"]))
-                * Decimal(str(rates[o["currency"]]))
+                * Decimal(str(rates[source_currency]))
             )
-            totals[o["product"]] = totals.get(
-                o["product"], Decimal("0")
+            product = o["product"]
+            totals[product] = totals.get(
+                product, Decimal("0")
             ) + value
 
         if not totals:
             return None
+
         return sorted(
-            totals.items(), key=lambda x: (-x[1], x[0])
+            totals.items(),
+            key=lambda item: (-item[1], item[0]),
         )[0][0]
 
-    total_usd = sum(
-        (
-            Decimal(str(o["amount"]))
-            * Decimal(str(rates[o["currency"]]))
-            for o in selected
-        ),
-        Decimal("0"),
-    )
+    # Revenue/refund total, converted to requested currency.
+    total_usd = Decimal("0")
 
-    # Rates specify USD per unit of the source currency.
+    for o in selected:
+        source_currency = o["currency"]
+        if source_currency not in rates:
+            continue
+
+        total_usd += (
+            Decimal(str(o["amount"]))
+            * Decimal(str(rates[source_currency]))
+        )
+
     answer = total_usd / Decimal(str(rates[currency]))
     return float(money(answer))
 
@@ -222,9 +270,15 @@ def answer_question(body: Question):
         return {"answer": result}
     except requests.RequestException as exc:
         raise HTTPException(
-            status_code=502, detail="Ledger API request failed"
+            status_code=502,
+            detail="Ledger API request failed",
         ) from exc
     except (KeyError, ValueError, RuntimeError) as exc:
         raise HTTPException(
-            status_code=500, detail=str(exc)
+            status_code=500,
+            detail=str(exc),
         ) from exc
+
+
+
+
